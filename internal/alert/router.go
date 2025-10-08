@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"sync"
 	"time"
@@ -31,6 +32,13 @@ type Alert struct {
 type Sink interface {
 	Name() string
 	Send(ctx context.Context, alert Alert) error
+}
+
+// Starter is implemented by sinks that require their own goroutine (e.g. a
+// terminal UI). The router invokes Start with the same context it uses for
+// workers, and stops the sink when that context is cancelled.
+type Starter interface {
+	Start(ctx context.Context) error
 }
 
 // Router keeps fan-out logic for alerts.
@@ -91,17 +99,47 @@ func (r *Router) Dispatch(alert Alert) {
 }
 
 // Run processes alerts until the context is cancelled.
-func (r *Router) Run(ctx context.Context) {
-	var wg sync.WaitGroup
+func (r *Router) Run(parent context.Context) {
+	runCtx, cancel := context.WithCancel(parent)
+	defer cancel()
+
+	errCh := make(chan error, len(r.sinks))
+
+	var starterWG sync.WaitGroup
+	for _, sink := range r.sinks {
+		if starter, ok := sink.(Starter); ok {
+			starterWG.Add(1)
+			go func(st Starter) {
+				defer starterWG.Done()
+				if err := st.Start(runCtx); err != nil && !errors.Is(err, context.Canceled) {
+					select {
+					case errCh <- err:
+					default:
+					}
+				}
+			}(starter)
+		}
+	}
+
+	var workerWG sync.WaitGroup
 	for i := 0; i < workerCount; i++ {
-		wg.Add(1)
+		workerWG.Add(1)
 		go func() {
-			defer wg.Done()
-			r.worker(ctx)
+			defer workerWG.Done()
+			r.worker(runCtx)
 		}()
 	}
-	<-ctx.Done()
-	wg.Wait()
+
+	select {
+	case <-runCtx.Done():
+	case err := <-errCh:
+		r.logger.Error().Err(err).Msg("alert sink terminated")
+		cancel()
+	}
+
+	workerWG.Wait()
+	cancel()
+	starterWG.Wait()
 }
 
 func (r *Router) worker(ctx context.Context) {

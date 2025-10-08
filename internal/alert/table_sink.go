@@ -2,66 +2,31 @@ package alert
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
 	"github.com/shopspring/decimal"
 
 	"github.com/esshka/fp-scanner-go/internal/config"
 )
 
 const (
-	tableClearCommand = "\033[H\033[2J"
-	tableHeader       = "+----------+--------+---------+--------------+------------+------------+----------------------+----------------------+"
-	patternWidth      = 20
-	redrawInterval    = 500 * time.Millisecond
+	patternColumnWidth = 32
+	windowsColumnWidth = 18
 )
 
 type tableSink struct {
-	mu       sync.Mutex
-	stats    map[string]map[time.Duration]*aggregateStats
-	lastDraw time.Time
-}
+	app   *tview.Application
+	table *tview.Table
 
-func newTableSink() *tableSink {
-	return &tableSink{stats: make(map[string]map[time.Duration]*aggregateStats)}
-}
-
-func (t *tableSink) Name() string { return "table" }
-
-func (t *tableSink) Send(_ context.Context, a Alert) error {
-	_, size, _ := parseKeyFields(a)
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	diff := a.LastSeen.Sub(a.FirstSeen)
-	if diff < 0 {
-		diff = 0
-	}
-
-	stats := t.ensureStats(a.InstID, a.Window)
-	stats.alerts++
-	volume := size.Mul(decimal.NewFromInt(int64(a.Count)))
-	stats.totalVolume = stats.totalVolume.Add(volume)
-	stats.totalDiff += diff
-	if diff > stats.maxDiff {
-		stats.maxDiff = diff
-	}
-	if a.LastSeen.After(stats.lastAlert) {
-		stats.lastAlert = a.LastSeen
-	}
-	stats.lastPattern = formatPattern(a)
-
-	if time.Since(t.lastDraw) >= redrawInterval {
-		t.render()
-		t.lastDraw = time.Now()
-	}
-
-	return nil
+	mu    sync.Mutex
+	stats map[string]map[string]*aggregateStats
 }
 
 type aggregateStats struct {
@@ -70,73 +35,206 @@ type aggregateStats struct {
 	totalDiff   time.Duration
 	maxDiff     time.Duration
 	lastAlert   time.Time
-	lastPattern string
+	windows     map[time.Duration]struct{}
 }
 
-func (t *tableSink) ensureStats(instID string, window time.Duration) *aggregateStats {
-	perWindow, ok := t.stats[instID]
-	if !ok {
-		perWindow = make(map[time.Duration]*aggregateStats)
-		t.stats[instID] = perWindow
+type tableEntry struct {
+	instrument  string
+	pattern     string
+	alerts      int
+	totalVolume decimal.Decimal
+	avgDiff     time.Duration
+	maxDiff     time.Duration
+	windows     []time.Duration
+	lastAlert   time.Time
+}
+
+func newTableSink() *tableSink {
+	app := tview.NewApplication()
+	tbl := tview.NewTable().
+		SetBorders(false).
+		SetFixed(1, 0).
+		SetSelectable(true, false)
+
+	tbl.SetBorder(true).
+		SetTitle(" Duplicate Patterns ")
+
+	return &tableSink{
+		app:   app,
+		table: tbl,
+		stats: make(map[string]map[string]*aggregateStats),
 	}
-	stat, ok := perWindow[window]
+}
+
+func (t *tableSink) Name() string { return "tview" }
+
+// Start implements a lifecycle hook allowing the router to run the TUI.
+func (t *tableSink) Start(ctx context.Context) error {
+	go func() {
+		<-ctx.Done()
+		t.app.QueueUpdateDraw(func() {
+			t.app.Stop()
+		})
+	}()
+
+	t.table.SetCell(0, 0, headerCell("Ticker")).
+		SetCell(0, 1, headerCell("Pattern")).
+		SetCell(0, 2, headerCell("Alerts")).
+		SetCell(0, 3, headerCell("Total Vol"))
+
+	t.update([]tableEntry{})
+
+	t.app.SetRoot(t.table, true)
+	t.app.EnableMouse(true)
+
+	if err := t.app.Run(); err != nil && !errors.Is(err, context.Canceled) {
+		return err
+	}
+	return nil
+}
+
+func (t *tableSink) Send(_ context.Context, alert Alert) error {
+	_, size, _ := parseKeyFields(alert)
+
+	t.mu.Lock()
+	stats := t.ensureStats(alert.InstID, formatPattern(alert))
+
+	diff := alert.LastSeen.Sub(alert.FirstSeen)
+	if diff < 0 {
+		diff = 0
+	}
+
+	stats.alerts++
+	stats.totalVolume = stats.totalVolume.Add(size.Mul(decimal.NewFromInt(int64(alert.Count))))
+	stats.totalDiff += diff
+	if diff > stats.maxDiff {
+		stats.maxDiff = diff
+	}
+	if alert.LastSeen.After(stats.lastAlert) {
+		stats.lastAlert = alert.LastSeen
+	}
+	if stats.windows == nil {
+		stats.windows = make(map[time.Duration]struct{})
+	}
+	stats.windows[alert.Window] = struct{}{}
+
+	snapshot := t.snapshotLocked()
+	t.mu.Unlock()
+
+	t.app.QueueUpdateDraw(func() {
+		t.update(snapshot)
+	})
+
+	return nil
+}
+
+func (t *tableSink) ensureStats(instID, pattern string) *aggregateStats {
+	perPattern, ok := t.stats[instID]
+	if !ok {
+		perPattern = make(map[string]*aggregateStats)
+		t.stats[instID] = perPattern
+	}
+	stat, ok := perPattern[pattern]
 	if !ok {
 		stat = &aggregateStats{}
-		perWindow[window] = stat
+		perPattern[pattern] = stat
 	}
 	return stat
 }
 
-func (t *tableSink) render() {
-	fmt.Print(tableClearCommand)
-	fmt.Println(tableHeader)
-	fmt.Println("| Ticker   | Window | Alerts  | Total Volume | Avg Diff   | Max Diff   | Last Alert (local)  | Last Pattern         |")
-	fmt.Println(tableHeader)
-
-	instIDs := make([]string, 0, len(t.stats))
-	for inst := range t.stats {
-		instIDs = append(instIDs, inst)
-	}
-	sort.Strings(instIDs)
-
-	for _, inst := range instIDs {
-		windows := make([]time.Duration, 0, len(t.stats[inst]))
-		for w := range t.stats[inst] {
-			windows = append(windows, w)
-		}
-		sort.Slice(windows, func(i, j int) bool { return windows[i] < windows[j] })
-
-		for _, w := range windows {
-			stats := t.stats[inst][w]
+func (t *tableSink) snapshotLocked() []tableEntry {
+	entries := make([]tableEntry, 0)
+	for inst, patterns := range t.stats {
+		for pattern, stats := range patterns {
 			avg := time.Duration(0)
 			if stats.alerts > 0 {
 				avg = time.Duration(int64(stats.totalDiff) / int64(stats.alerts))
 			}
-			last := "-"
-			if !stats.lastAlert.IsZero() {
-				last = stats.lastAlert.In(time.Local).Format("15:04:05")
+			windows := make([]time.Duration, 0, len(stats.windows))
+			for w := range stats.windows {
+				windows = append(windows, w)
 			}
-			pattern := stats.lastPattern
-			if pattern == "" {
-				pattern = "-"
-			}
-			fmt.Printf("| %-8s | %-6s | %7d | %-12s | %-10s | %-10s | %-20s | %-20s |\n",
-				inst,
-				formatWindow(w),
-				stats.alerts,
-				stats.totalVolume.String(),
-				fmtDuration(avg),
-				fmtDuration(stats.maxDiff),
-				last,
-				truncateString(pattern, patternWidth),
-			)
+			entries = append(entries, tableEntry{
+				instrument:  inst,
+				pattern:     pattern,
+				alerts:      stats.alerts,
+				totalVolume: stats.totalVolume,
+				avgDiff:     avg,
+				maxDiff:     stats.maxDiff,
+				windows:     windows,
+				lastAlert:   stats.lastAlert,
+			})
 		}
 	}
 
-	fmt.Println(tableHeader)
+	sort.Slice(entries, func(i, j int) bool {
+		cmp := entries[i].totalVolume.Cmp(entries[j].totalVolume)
+		if cmp == 0 {
+			if entries[i].instrument == entries[j].instrument {
+				return entries[i].pattern < entries[j].pattern
+			}
+			return entries[i].instrument < entries[j].instrument
+		}
+		return cmp > 0
+	})
+
+	return entries
 }
 
-func fmtDuration(d time.Duration) string {
+func (t *tableSink) update(entries []tableEntry) {
+	currentRow, currentCol := t.table.GetSelection()
+
+	t.table.Clear()
+
+	headers := []string{"Ticker", "Pattern", "Alerts", "Total Volume", "Avg Diff", "Max Diff", "Windows", "Last Alert"}
+	for col, text := range headers {
+		t.table.SetCell(0, col, headerCell(text))
+	}
+
+	for row, entry := range entries {
+		r := row + 1
+		t.table.SetCell(r, 0, valueCell(entry.instrument))
+		t.table.SetCell(r, 1, valueCell(truncateString(entry.pattern, patternColumnWidth)))
+		t.table.SetCell(r, 2, valueCell(fmt.Sprintf("%d", entry.alerts)).SetAlign(tview.AlignRight))
+		t.table.SetCell(r, 3, valueCell(entry.totalVolume.String()).SetAlign(tview.AlignRight))
+		t.table.SetCell(r, 4, valueCell(formatDuration(entry.avgDiff)))
+		t.table.SetCell(r, 5, valueCell(formatDuration(entry.maxDiff)))
+		t.table.SetCell(r, 6, valueCell(truncateString(formatWindows(entry.windows), windowsColumnWidth)))
+		last := "-"
+		if !entry.lastAlert.IsZero() {
+			last = entry.lastAlert.In(time.Local).Format("15:04:05")
+		}
+		t.table.SetCell(r, 7, valueCell(last))
+	}
+
+	if len(entries) == 0 {
+		t.table.Select(0, 0)
+		return
+	}
+
+	if currentRow <= 0 || currentRow > len(entries) {
+		t.table.Select(1, 0)
+		return
+	}
+
+	t.table.Select(currentRow, currentCol)
+}
+
+func headerCell(text string) *tview.TableCell {
+	return tview.NewTableCell(text).
+		SetTextColor(tcell.ColorAqua).
+		SetSelectable(false).
+		SetAlign(tview.AlignLeft).
+		SetAttributes(tcell.AttrBold)
+}
+
+func valueCell(text string) *tview.TableCell {
+	return tview.NewTableCell(text).
+		SetTextColor(tcell.ColorWhite).
+		SetAlign(tview.AlignLeft)
+}
+
+func formatDuration(d time.Duration) string {
 	if d <= 0 {
 		return "00:00:00"
 	}
@@ -145,6 +243,75 @@ func fmtDuration(d time.Duration) string {
 	m := (seconds % 3600) / 60
 	s := seconds % 60
 	return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
+}
+
+func formatWindows(set []time.Duration) string {
+	if len(set) == 0 {
+		return "-"
+	}
+	sort.Slice(set, func(i, j int) bool { return set[i] < set[j] })
+	parts := make([]string, len(set))
+	for i, w := range set {
+		parts[i] = fmt.Sprintf("%ds", int(w.Seconds()))
+	}
+	return strings.Join(parts, ",")
+}
+
+func formatPattern(alert Alert) string {
+	price, size, side := parseKeyFields(alert)
+	direction := formatDirection(side)
+
+	switch alert.DuplicateMode {
+	case config.DuplicateModePriceOnly:
+		if price.Equal(decimal.Zero) {
+			return direction
+		}
+		if direction == "" {
+			return price.String()
+		}
+		return fmt.Sprintf("%s %s", price.String(), direction)
+	default:
+		base := ""
+		if !price.Equal(decimal.Zero) && !size.Equal(decimal.Zero) {
+			base = fmt.Sprintf("%s x %s", price.String(), size.String())
+		} else if !price.Equal(decimal.Zero) {
+			base = price.String()
+		} else {
+			base = alert.Key
+		}
+		if direction == "" {
+			return base
+		}
+		return strings.TrimSpace(base + " " + direction)
+	}
+}
+
+func formatDirection(side string) string {
+	side = strings.ToLower(strings.TrimSpace(side))
+	switch side {
+	case "buy":
+		return "Up"
+	case "sell":
+		return "Down"
+	case "":
+		return ""
+	default:
+		return strings.Title(side)
+	}
+}
+
+func truncateString(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= width {
+		return s
+	}
+	if width == 1 {
+		return string(runes[0])
+	}
+	return string(runes[:width-1]) + "…"
 }
 
 func parseKeyFields(a Alert) (price decimal.Decimal, size decimal.Decimal, side string) {
@@ -177,66 +344,4 @@ func safeDecimal(value string) decimal.Decimal {
 		return decimal.Zero
 	}
 	return d
-}
-
-func formatWindow(d time.Duration) string {
-	if d <= 0 {
-		return "-"
-	}
-	return fmt.Sprintf("%ds", int(d.Seconds()))
-}
-
-func formatPattern(a Alert) string {
-	price, size, side := parseKeyFields(a)
-	direction := formatDirection(side)
-
-	var base string
-	switch a.DuplicateMode {
-	case config.DuplicateModePriceOnly:
-		if !price.Equal(decimal.Zero) {
-			base = price.String()
-		}
-	default:
-		if !price.Equal(decimal.Zero) && !size.Equal(decimal.Zero) {
-			base = fmt.Sprintf("%s x %s", price.String(), size.String())
-		} else if !price.Equal(decimal.Zero) {
-			base = price.String()
-		}
-	}
-
-	if base == "" {
-		base = a.Key
-	}
-	if direction != "" {
-		return strings.TrimSpace(base + " " + direction)
-	}
-	return base
-}
-
-func formatDirection(side string) string {
-	side = strings.ToLower(strings.TrimSpace(side))
-	switch side {
-	case "buy":
-		return "Up"
-	case "sell":
-		return "Down"
-	case "":
-		return ""
-	default:
-		return strings.Title(side)
-	}
-}
-
-func truncateString(s string, max int) string {
-	if max <= 0 {
-		return ""
-	}
-	runes := []rune(s)
-	if len(runes) <= max {
-		return s
-	}
-	if max == 1 {
-		return string(runes[0])
-	}
-	return string(runes[:max-1]) + "…"
 }

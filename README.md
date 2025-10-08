@@ -65,7 +65,7 @@ implementation.
 | `instruments` | List of `{instType, instId}` pairs. These are sharded across websocket connections according to `websocket.batchSize`. |
 | `websocket`   | `maxMessagesPerSec`, `subscribeChunk`, and `subscribeInterval` enforce Bitget’s 10 msg/s budget. `backoff` controls reconnect behaviour (initial/max interval, multiplier, jitter). |
 | `screener`    | `windows` accepts Go duration strings (`30s`, `500ms`). `duplicateMode` can be `strict`, `priceOnly`, or `bucketed` (requires `bucket.priceTick` and `bucket.sizeTick`). `cooldown` throttles repeat alerts per `(instId, window, key)`. |
-| `alerts`      | `console` toggles structured logs; `table` enables an aggregated per-instrument terminal table similar to desktop scanners. `webhooks` is a list of HTTPS endpoints. `slackWebhook` sends Slack-compatible payloads. `retry` uses exponential backoff when a sink fails. |
+| `alerts`      | `console` toggles structured logs; `table` launches a full-screen TUI (built with `tview`) that aggregates duplicates per instrument and pattern. `webhooks` is a list of HTTPS endpoints. `slackWebhook` sends Slack-compatible payloads. `retry` uses exponential backoff when a sink fails. |
 | `metrics`     | Set `listenAddr` for the Prometheus HTTP listener, e.g. `":9100"` or `"0.0.0.0:9100"`. |
 | `warmStart`   | Enable to fetch recent trades via REST after reconnects. `lookback` defines how far back to replay trades; `maxRequestsPerSecond` throttles requests per Bitget’s 10 rps cap. |
 
@@ -85,18 +85,20 @@ Sample log:
 
 Enable human-readable logs with `logging.human=true` while tuning, or switch on `alerts.table=true` to render an ASCII table that mimics common desktop scanners. Once integrated with log pipelines, revert to JSON console output for parsing.
 
-Example aggregated table (`alerts.table=true`):
+Example aggregated TUI table (`alerts.table=true`):
 
 ```
-+----------+--------+---------+--------------+------------+------------+----------------------+----------------------+
-| Ticker   | Window | Alerts  | Total Volume | Avg Diff   | Max Diff   | Last Alert (local)  | Last Pattern         |
-+----------+--------+---------+--------------+------------+------------+----------------------+----------------------+
-| COAIUSDT | 11s    |       5 | 16.42        | 00:00:03   | 00:00:05   | 13:44:22             | 3.7876 x 2.63 Down   |
-| COAIUSDT | 30s    |       2 | 10.52        | 00:00:46   | 00:01:08   | 13:44:22             | 3.7854 x 0.43 Up     |
-+----------+--------+---------+--------------+------------+------------+----------------------+----------------------+
++----------+----------------------+---------+--------------+------------+------------+----------------------+----------------------+
+| Ticker   | Pattern              | Alerts  | Total Volume | Avg Diff   | Max Diff   | Windows        | Last Alert (local)  |
++----------+----------------------+---------+--------------+------------+------------+----------------------+----------------------+
+| COAIUSDT | 3.7876 x 2.63 Down   |       5 | 16.42        | 00:00:03   | 00:00:05   | 11s,12s,15s,30s | 13:44:22             |
+| COAIUSDT | 3.7854 x 0.43 Up     |       2 | 10.52        | 00:00:46   | 00:01:08   | 30s             | 13:44:22             |
++----------+----------------------+---------+--------------+------------+------------+----------------------+----------------------+
 ```
 
-`Alerts` counts how many duplicate alerts fired for that instrument/window, `Total Volume` sums the duplicate volume (`size × count` per alert), `Avg Diff`/`Max Diff` track the window span between first/last trade for each alert, `Last Alert` shows the most recent local timestamp, and `Last Pattern` mirrors the latest duplicate key (price/size/direction).
+Rows are sorted by cumulative duplicate volume. `Alerts` counts how many duplicate alerts fired for that instrument/pattern pair, `Total Volume` sums the duplicate volume (`size × count` per alert), `Avg Diff`/`Max Diff` track the window span between first/last trade for each alert, `Windows` lists the time windows that have triggered for that pattern, and `Last Alert` shows the latest local timestamp. Use the arrow keys or mouse to scroll within the TUI; exit with `Ctrl+C` or by sending the usual process signal.
+
+> The TUI renders directly to STDOUT; if you need structured logs simultaneously, consider shipping them to another sink (e.g. file) or running a second instance without `alerts.table`.
 
 ### Metrics & Health Checks
 
