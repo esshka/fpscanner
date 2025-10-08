@@ -70,27 +70,56 @@ func (t *tableSink) Name() string { return "tview" }
 
 // Start implements a lifecycle hook allowing the router to run the TUI.
 func (t *tableSink) Start(ctx context.Context) error {
+	stopCh := make(chan struct{})
+	var stopOnce sync.Once
+	requestStop := func() {
+		stopOnce.Do(func() { close(stopCh) })
+	}
+
+	t.mu.Lock()
+	t.stats = make(map[string]map[string]*aggregateStats)
+	t.mu.Unlock()
+
+	t.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch {
+		case event.Key() == tcell.KeyCtrlC,
+			event.Key() == tcell.KeyEscape,
+			event.Key() == tcell.KeyRune && (event.Rune() == 'q' || event.Rune() == 'Q'):
+			requestStop()
+			return nil
+		}
+		return event
+	})
+
 	go func() {
 		<-ctx.Done()
+		requestStop()
+	}()
+
+	go func() {
+		<-stopCh
 		t.app.QueueUpdateDraw(func() {
 			t.app.Stop()
 		})
 	}()
 
-	t.table.SetCell(0, 0, headerCell("Ticker")).
-		SetCell(0, 1, headerCell("Pattern")).
-		SetCell(0, 2, headerCell("Alerts")).
-		SetCell(0, 3, headerCell("Total Vol"))
-
-	t.update([]tableEntry{})
-
+	t.update(nil)
 	t.app.SetRoot(t.table, true)
 	t.app.EnableMouse(true)
 
-	if err := t.app.Run(); err != nil && !errors.Is(err, context.Canceled) {
+	err := t.app.Run()
+
+	select {
+	case <-ctx.Done():
+		return context.Canceled
+	case <-stopCh:
+		if err == nil || errors.Is(err, context.Canceled) {
+			return context.Canceled
+		}
+		return err
+	default:
 		return err
 	}
-	return nil
 }
 
 func (t *tableSink) Send(_ context.Context, alert Alert) error {

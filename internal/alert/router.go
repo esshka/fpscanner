@@ -133,7 +133,9 @@ func (r *Router) Run(parent context.Context) {
 	select {
 	case <-runCtx.Done():
 	case err := <-errCh:
-		r.logger.Error().Err(err).Msg("alert sink terminated")
+		if err != nil && !errors.Is(err, context.Canceled) {
+			r.logger.Error().Err(err).Msg("alert sink terminated")
+		}
 		cancel()
 	}
 

@@ -96,7 +96,7 @@ Example aggregated TUI table (`alerts.table=true`):
 +----------+----------------------+---------+--------------+------------+------------+----------------------+----------------------+
 ```
 
-Rows are sorted by cumulative duplicate volume. `Alerts` counts how many duplicate alerts fired for that instrument/pattern pair, `Total Volume` sums the duplicate volume (`size × count` per alert), `Avg Diff`/`Max Diff` track the window span between first/last trade for each alert, `Windows` lists the time windows that have triggered for that pattern, and `Last Alert` shows the latest local timestamp. Use the arrow keys or mouse to scroll within the TUI; exit with `Ctrl+C` or by sending the usual process signal.
+Rows are sorted by cumulative duplicate volume. `Alerts` counts how many duplicate alerts fired for that instrument/pattern pair, `Total Volume` sums the duplicate volume (`size × count` per alert), `Avg Diff`/`Max Diff` track the window span between first/last trade for each alert, `Windows` lists the time windows that have triggered for that pattern, and `Last Alert` shows the latest local timestamp. Use the arrow keys or mouse to scroll within the TUI; press `q`, `Esc`, or `Ctrl+C` to exit.
 
 > The TUI renders directly to STDOUT; if you need structured logs simultaneously, consider shipping them to another sink (e.g. file) or running a second instance without `alerts.table`.
 
