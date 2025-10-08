@@ -1,0 +1,48 @@
+# Example configuration for the Bitget identical prints screener.
+logging:
+  level: info
+  human: true
+
+instruments:
+  - instType: SPOT
+    instId: COAIUSDT
+  - instType: SPOT
+    instId: BANKUSDT
+
+websocket:
+  url: wss://ws.bitget.com/v2/ws/public
+  pingInterval: 30s
+  maxMessagesPerSec: 10
+  batchSize: 40
+  subscribeChunk: 20
+  subscribeInterval: 300ms
+
+screener:
+  duplicateMode: strict
+  minDupes: 2
+  windows:
+    - 30s
+    - 15s
+    - 12s
+    - 11s
+  cooldown: 60s
+  bucket:
+    priceTick: "0.1"
+    sizeTick: "0.1"
+
+alerts:
+  console: true
+  webhooks: []
+  cooldown: 60s
+  timeout: 5s
+  table: true
+
+metrics:
+  listenAddr: ":9100"
+
+warmStart:
+  enable: false
+  baseUrl: https://api.bitget.com
+  restEndpoint: /api/v2/spot/market/fills
+  lookback: 3s
+  maxRequestsPerSecond: 8

@@ -1,0 +1,34 @@
+# Go build outputs
+/fpscanner
+/fpscanner.exe
+/bin/
+/build/
+/dist/
+/out/
+*.test
+
+# Coverage and profiling data
+*.cover
+*.coverprofile
+*.out
+coverage.*
+
+# Local configuration and secrets
+config.yaml
+*.local.yaml
+.env
+.env.*
+*.log
+
+# Editor and OS metadata
+.idea/
+.vscode/
+*.code-workspace
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+*.swp
+*.swo
+config.yaml
