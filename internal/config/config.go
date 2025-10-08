@@ -122,13 +122,14 @@ type BucketConfig struct {
 
 // AlertConfig holds sink configuration for alerts.
 type AlertConfig struct {
-	Console      bool          `yaml:"console"`
-	Table        bool          `yaml:"table"`
-	Webhooks     []string      `yaml:"webhooks"`
-	SlackWebhook string        `yaml:"slackWebhook"`
-	Cooldown     Duration      `yaml:"cooldown"`
-	Timeout      Duration      `yaml:"timeout"`
-	Retry        BackoffConfig `yaml:"retry"`
+	Console        bool          `yaml:"console"`
+	Table          bool          `yaml:"table"`
+	Webhooks       []string      `yaml:"webhooks"`
+	SlackWebhook   string        `yaml:"slackWebhook"`
+	Cooldown       Duration      `yaml:"cooldown"`
+	Timeout        Duration      `yaml:"timeout"`
+	Retry          BackoffConfig `yaml:"retry"`
+	TableRetention Duration      `yaml:"tableRetention"`
 }
 
 // MetricsConfig configures the Prometheus metrics endpoint.
@@ -225,6 +226,7 @@ func defaultConfig() *Config {
 				Multiplier: 2.0,
 				Jitter:     0.2,
 			},
+			TableRetention: Duration{Duration: 15 * time.Minute},
 		},
 		Metrics: MetricsConfig{
 			ListenAddr: ":9100",
@@ -328,6 +330,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Alerts.Retry.Jitter == 0 {
 		c.Alerts.Retry.Jitter = 0.2
+	}
+	if c.Alerts.TableRetention.Duration == 0 {
+		c.Alerts.TableRetention = Duration{Duration: 15 * time.Minute}
 	}
 
 	if c.Metrics.ListenAddr == "" {

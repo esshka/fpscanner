@@ -36,6 +36,7 @@ alerts:
   cooldown: 60s
   timeout: 5s
   table: true
+  tableRetention: 15m
 
 metrics:
   listenAddr: ":9100"

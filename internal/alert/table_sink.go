@@ -25,8 +25,10 @@ type tableSink struct {
 	app   *tview.Application
 	table *tview.Table
 
-	mu    sync.Mutex
-	stats map[string]map[string]*aggregateStats
+	mu        sync.Mutex
+	stats     map[string]map[string]*aggregateStats
+	start     time.Time
+	retention time.Duration
 }
 
 type aggregateStats struct {
@@ -49,7 +51,7 @@ type tableEntry struct {
 	lastAlert   time.Time
 }
 
-func newTableSink() *tableSink {
+func newTableSink(retention time.Duration) *tableSink {
 	app := tview.NewApplication()
 	tbl := tview.NewTable().
 		SetBorders(false).
@@ -60,9 +62,10 @@ func newTableSink() *tableSink {
 		SetTitle(" Duplicate Patterns ")
 
 	return &tableSink{
-		app:   app,
-		table: tbl,
-		stats: make(map[string]map[string]*aggregateStats),
+		app:       app,
+		table:     tbl,
+		stats:     make(map[string]map[string]*aggregateStats),
+		retention: retention,
 	}
 }
 
@@ -78,6 +81,7 @@ func (t *tableSink) Start(ctx context.Context) error {
 
 	t.mu.Lock()
 	t.stats = make(map[string]map[string]*aggregateStats)
+	t.start = time.Now()
 	t.mu.Unlock()
 
 	t.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
@@ -173,8 +177,17 @@ func (t *tableSink) ensureStats(instID, pattern string) *aggregateStats {
 
 func (t *tableSink) snapshotLocked() []tableEntry {
 	entries := make([]tableEntry, 0)
+	now := time.Now()
 	for inst, patterns := range t.stats {
 		for pattern, stats := range patterns {
+			if !t.start.IsZero() && (stats.lastAlert.IsZero() || stats.lastAlert.Before(t.start)) {
+				delete(patterns, pattern)
+				continue
+			}
+			if t.retention > 0 && !stats.lastAlert.IsZero() && now.Sub(stats.lastAlert) > t.retention {
+				delete(patterns, pattern)
+				continue
+			}
 			avg := time.Duration(0)
 			if stats.alerts > 0 {
 				avg = time.Duration(int64(stats.totalDiff) / int64(stats.alerts))
@@ -193,6 +206,9 @@ func (t *tableSink) snapshotLocked() []tableEntry {
 				windows:     windows,
 				lastAlert:   stats.lastAlert,
 			})
+		}
+		if len(patterns) == 0 {
+			delete(t.stats, inst)
 		}
 	}
 

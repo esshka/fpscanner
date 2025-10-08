@@ -64,7 +64,7 @@ func NewRouter(cfg config.AlertConfig, logger zerolog.Logger, collector *metrics
 		sinks = append(sinks, &consoleSink{logger: logger})
 	}
 	if cfg.Table {
-		sinks = append(sinks, newTableSink())
+		sinks = append(sinks, newTableSink(cfg.TableRetention.OrDefault(15*time.Minute)))
 	}
 	for i, url := range cfg.Webhooks {
 		sinks = append(sinks, newWebhookSink(url, cfg, logger.With().Str("sink", "webhook").Int("index", i).Logger()))
