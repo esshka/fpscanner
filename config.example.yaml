@@ -29,6 +29,15 @@ screener:
   bucket:
     priceTick: "0.1"
     sizeTick: "0.1"
+  pattern:
+    minOccurrences: 2
+    maxLookback: 6
+    maxJitter: 150ms
+    relativeJitter: 0.1
+    minInterval: 50ms
+  tagging:
+    notionalTick: 10
+    priceTick: ""
 
 alerts:
   console: true

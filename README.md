@@ -11,6 +11,10 @@ potential iceberg or flow patterns across many instruments.
 - Rate-limit aware websocket manager with automatic resubscribe & heartbeat.
 - Sliding-window duplicate detection for 30s/15s/12s/11s (configurable) using
   strict, price-only, or bucketed keys.
+- Timing pattern detection to surface uniform-cadence trade bursts that often
+  indicate automated order flow.
+- Automatic robot tagging to group recurring patterns and surface aggregate
+  statistics per tag.
 - Pluggable alert router: console logging by default, plus generic webhooks and
   Slack-compatible webhook delivery with retry and timeout controls.
 - Optional REST warm-start to backfill trades on reconnect while respecting
@@ -49,7 +53,9 @@ potential iceberg or flow patterns across many instruments.
 - `websocket`: tune batching (`batchSize`), subscribe chunking, and ping
   intervals to meet Bitget's 10 msg/sec / 4096 byte limits.
 - `screener`: choose `duplicateMode` (`strict`, `priceOnly`, `bucketed`), set
-  `windows`, `minDupes`, and per-key `cooldown`.
+  `windows`, `minDupes`, and per-key `cooldown`. Use the `pattern` block to tune
+  cadence detection (minimum occurrences – defaults to 2, jitter tolerance, cadence floor), and
+  the `tagging` block to bucket price/notional when deriving robot IDs.
 - `alerts`: enable console/log sinks or define webhook targets. Slack incoming
   webhooks plug in under `alerts.slackWebhook`.
 - `warmStart`: enable REST recovery with a lookback horizon; the service filters
@@ -64,7 +70,7 @@ implementation.
 |--------------|--------------|
 | `instruments` | List of `{instType, instId}` pairs. These are sharded across websocket connections according to `websocket.batchSize`. |
 | `websocket`   | `maxMessagesPerSec`, `subscribeChunk`, and `subscribeInterval` enforce Bitget’s 10 msg/s budget. `backoff` controls reconnect behaviour (initial/max interval, multiplier, jitter). |
-| `screener`    | `windows` accepts Go duration strings (`30s`, `500ms`). `duplicateMode` can be `strict`, `priceOnly`, or `bucketed` (requires `bucket.priceTick` and `bucket.sizeTick`, which now controls USDT notional bucketing). `cooldown` throttles repeat alerts per `(instId, window, key)`. |
+| `screener`    | `windows` accepts Go duration strings (`30s`, `500ms`). `duplicateMode` can be `strict`, `priceOnly`, or `bucketed` (requires `bucket.priceTick` and `bucket.sizeTick`, which now controls USDT notional bucketing). `cooldown` throttles repeat alerts per `(instId, window, key)`. The optional `pattern` block sets cadence detection thresholds (`minOccurrences`, `maxLookback`, `maxJitter`, `relativeJitter`, `minInterval`). |
 | `alerts`      | `console` toggles structured logs; `table` starts a lightweight web UI (served from `tableListenAddr`, default `:9300`) that aggregates duplicates per instrument and pattern. `tableRetention` controls how long inactive rows stick around (default 15m). `webhooks` is a list of HTTPS endpoints. `slackWebhook` sends Slack-compatible payloads. `retry` uses exponential backoff when a sink fails. |
 | `metrics`     | Set `listenAddr` for the Prometheus HTTP listener, e.g. `":9100"` or `"0.0.0.0:9100"`. |
 | `warmStart`   | Enable to fetch recent trades via REST after reconnects. `lookback` defines how far back to replay trades; `maxRequestsPerSecond` throttles requests per Bitget’s 10 rps cap. |
@@ -82,21 +88,25 @@ Sample log:
 - `count` is how many matching trades landed inside the sliding window; `firstSeen` and `lastSeen` are UTC.
 - `windowSec` indicates which window triggered the alert. Multiple windows may fire if the trades overlap several durations.
 - `sink` reveals the destination (console, webhook, Slack, etc.).
+- `robotTag` groups alerts under a stable identifier for the detected flow.
+- `timingPattern` appears when the detector identifies a near-uniform cadence; it carries the observed interval, jitter spread, and number of samples used.
 
 Enable human-readable logs with `logging.human=true` while tuning, or switch on `alerts.table=true` to launch the built-in web UI at `http://<tableListenAddr>` (defaults to `http://localhost:9300`). The page auto-refreshes every few seconds and also exposes a JSON feed at `/api/alerts`. Once integrated with log pipelines, revert to JSON console output for parsing.
 
 Example web UI snapshot (`alerts.table=true`):
 
+The table groups alerts by robot tag, combining every instrument that shares the detected cadence.
+
 ```
-+----------+---------------------------+---------+-----------------------+------------+------------+----------------------+----------------------+
-| Ticker   | Pattern                   | Alerts  | Total Notional (USDT) | Avg Diff   | Max Diff   | Windows              | Last Alert (local)  |
-+----------+---------------------------+---------+-----------------------+------------+------------+----------------------+----------------------+
-| COAIUSDT | 3.7876 x 42.90 USDT Down  |       5 | 214.50                | 00:00:03   | 00:00:05   | 11s,12s,15s,30s      | 13:44:22             |
-| COAIUSDT | 3.7854 x 38.70 USDT Up    |       2 | 77.40                 | 00:00:46   | 00:01:08   | 30s                  | 13:44:22             |
-+----------+---------------------------+---------+-----------------------+------------+------------+----------------------+----------------------+
++--------+----------------------+---------------------------+--------+-----------------------+------------+------------+----------------------+---------------------------+----------------------+
+| Tag    | Instruments          | Pattern                   | Alerts | Total Notional (USDT) | Avg Diff   | Max Diff   | Windows              | Cadence                   | Last Alert (local)   |
++--------+----------------------+---------------------------+--------+-----------------------+------------+------------+----------------------+---------------------------+----------------------+
+| RB-001 | COAIUSDT             | 3.7876 x 42.90 USDT Down  |      5 | 214.50                | 00:00:03   | 00:00:05   | 11s,12s,15s,30s      | 200ms (spread 20ms), n=6  | 13:44:22             |
+| RB-002 | COAIUSDT, BANKUSDT   | 3.7854 x 38.70 USDT Up    |      3 | 115.50                | 00:00:40   | 00:01:05   | 30s                  | -                         | 13:44:22             |
++--------+----------------------+---------------------------+--------+-----------------------+------------+------------+----------------------+---------------------------+----------------------+
 ```
 
-Rows are sorted by cumulative duplicate notional. `Alerts` counts how many duplicate alerts fired for that instrument/pattern pair, `Total Notional (USDT)` sums the duplicate notional (`price × size × count` per alert), `Avg Diff`/`Max Diff` track the window span between first/last trade for each alert, `Windows` lists the time windows that have triggered for that pattern, and `Last Alert` shows the latest local timestamp. Rows older than `alerts.tableRetention` (and anything observed before the current run) are automatically purged. The HTML view refreshes automatically; hit `/api/alerts` for the underlying JSON if you want to drive dashboards or bots.
+Rows are sorted by cumulative duplicate notional. `Alerts` counts how many alerts fired for that tag, `Total Notional (USDT)` sums the duplicate notional (`price × size × count` per alert), `Avg Diff`/`Max Diff` track the window span between first/last trade for the tag, `Windows` lists the time windows that have triggered, `Cadence` summarises the detected timing pattern, and `Last Alert` shows the latest local timestamp. Rows older than `alerts.tableRetention` (and anything observed before the current run) are automatically purged. The HTML view refreshes automatically; hit `/api/alerts` for the underlying JSON if you want to drive dashboards or bots.
 
 > The web UI runs on the configured `alerts.tableListenAddr`. Make sure the port is reachable (or firewalled) according to your environment.
 

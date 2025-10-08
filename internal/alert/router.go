@@ -26,7 +26,22 @@ type Alert struct {
 	Count         int                  `json:"count"`
 	FirstSeen     time.Time            `json:"firstSeen"`
 	LastSeen      time.Time            `json:"lastSeen"`
+	TimingPattern *TimingPattern       `json:"timingPattern,omitempty"`
+	RobotTag      string               `json:"robotTag,omitempty"`
 }
+
+// TimingPattern contains metadata about a detected temporal cadence.
+type TimingPattern struct {
+	Type     string        `json:"type"`
+	Interval time.Duration `json:"interval"`
+	Jitter   time.Duration `json:"jitter"`
+	Samples  int           `json:"samples"`
+}
+
+const (
+	// PatternTypeUniformInterval indicates trades repeating on a near-uniform cadence.
+	PatternTypeUniformInterval = "uniformInterval"
+)
 
 // Sink delivers alerts to downstream systems.
 type Sink interface {
@@ -176,17 +191,25 @@ type consoleSink struct {
 func (c *consoleSink) Name() string { return "console" }
 
 func (c *consoleSink) Send(_ context.Context, alert Alert) error {
-	c.logger.Info().
+	event := c.logger.Info().
 		Str("sink", c.Name()).
 		Str("instId", alert.InstID).
 		Str("instType", alert.InstType).
 		Float64("windowSec", alert.Window.Seconds()).
 		Str("mode", string(alert.DuplicateMode)).
 		Int("count", alert.Count).
+		Str("robotTag", alert.RobotTag).
 		Str("key", alert.Key).
 		Time("firstSeen", alert.FirstSeen).
-		Time("lastSeen", alert.LastSeen).
-		Msg("duplicate detected")
+		Time("lastSeen", alert.LastSeen)
+	if tp := alert.TimingPattern; tp != nil {
+		event = event.
+			Str("patternType", tp.Type).
+			Float64("patternIntervalSec", tp.Interval.Seconds()).
+			Float64("patternJitterSec", tp.Jitter.Seconds()).
+			Int("patternSamples", tp.Samples)
+	}
+	event.Msg("duplicate detected")
 	return nil
 }
 

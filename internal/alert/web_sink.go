@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	patternColumnWidth = 32
+	patternColumnWidth = 48
 )
 
 type webSink struct {
@@ -28,30 +28,41 @@ type webSink struct {
 	logger     zerolog.Logger
 
 	mu    sync.RWMutex
-	stats map[string]map[string]*aggregateStats
+	stats map[string]*aggregateStats
 	start time.Time
 
 	server *http.Server
 }
 
 type aggregateStats struct {
-	alerts        int
-	totalNotional decimal.Decimal
-	totalDiff     time.Duration
-	maxDiff       time.Duration
-	lastAlert     time.Time
-	windows       map[time.Duration]struct{}
+	tag            string
+	pattern        string
+	alerts         int
+	totalNotional  decimal.Decimal
+	totalDiff      time.Duration
+	maxDiff        time.Duration
+	lastAlert      time.Time
+	windows        map[time.Duration]struct{}
+	instruments    map[string]int
+	cadence        time.Duration
+	cadenceJitter  time.Duration
+	cadenceSamples int
 }
 
 type tableEntry struct {
-	Instrument    string          `json:"instrument"`
-	Pattern       string          `json:"pattern"`
-	Alerts        int             `json:"alerts"`
-	TotalNotional decimal.Decimal `json:"totalNotional"`
-	AvgDiff       time.Duration   `json:"avgDiff"`
-	MaxDiff       time.Duration   `json:"maxDiff"`
-	Windows       []time.Duration `json:"windows"`
-	LastAlert     time.Time       `json:"lastAlert"`
+	Tag            string          `json:"tag"`
+	Pattern        string          `json:"pattern"`
+	Instruments    []string        `json:"instruments"`
+	Alerts         int             `json:"alerts"`
+	TotalNotional  decimal.Decimal `json:"totalNotional"`
+	AvgDiff        time.Duration   `json:"avgDiff"`
+	MaxDiff        time.Duration   `json:"maxDiff"`
+	Windows        []time.Duration `json:"windows"`
+	LastAlert      time.Time       `json:"lastAlert"`
+	Cadence        time.Duration   `json:"cadence,omitempty"`
+	CadenceJitter  time.Duration   `json:"cadenceJitter,omitempty"`
+	CadenceSamples int             `json:"cadenceSamples,omitempty"`
+	CadenceSummary string          `json:"cadenceSummary,omitempty"`
 }
 
 func newWebSink(addr string, retention time.Duration, logger zerolog.Logger) *webSink {
@@ -62,7 +73,7 @@ func newWebSink(addr string, retention time.Duration, logger zerolog.Logger) *we
 		listenAddr: addr,
 		retention:  retention,
 		logger:     logger,
-		stats:      make(map[string]map[string]*aggregateStats),
+		stats:      make(map[string]*aggregateStats),
 	}
 }
 
@@ -70,7 +81,7 @@ func (w *webSink) Name() string { return "web" }
 
 func (w *webSink) Start(ctx context.Context) error {
 	w.mu.Lock()
-	w.stats = make(map[string]map[string]*aggregateStats)
+	w.stats = make(map[string]*aggregateStats)
 	w.start = time.Now()
 	w.mu.Unlock()
 
@@ -108,42 +119,58 @@ func (w *webSink) Start(ctx context.Context) error {
 func (w *webSink) Send(_ context.Context, alert Alert) error {
 	_, notional, _ := parseKeyFields(alert)
 
-	w.mu.Lock()
-	stats := w.ensureStats(alert.InstID, formatPattern(alert))
+	tag := strings.TrimSpace(alert.RobotTag)
+	if tag == "" {
+		tag = formatPattern(alert)
+	}
+	pattern := formatPattern(alert)
 
 	diff := alert.LastSeen.Sub(alert.FirstSeen)
 	if diff < 0 {
 		diff = 0
 	}
 
-	stats.alerts++
-	stats.totalNotional = stats.totalNotional.Add(notional.Mul(decimal.NewFromInt(int64(alert.Count))))
-	stats.totalDiff += diff
-	if diff > stats.maxDiff {
-		stats.maxDiff = diff
+	w.mu.Lock()
+	stats := w.ensureStats(tag)
+
+	prevLast := stats.lastAlert
+	sameEvent := !alert.LastSeen.IsZero() && alert.LastSeen.Equal(prevLast)
+
+	stats.tag = tag
+	stats.pattern = pattern
+	stats.windows[alert.Window] = struct{}{}
+	if !sameEvent {
+		stats.alerts++
+		notionalTotal := notional.Mul(decimal.NewFromInt(int64(alert.Count)))
+		stats.totalNotional = stats.totalNotional.Add(notionalTotal)
+		stats.totalDiff += diff
+		if diff > stats.maxDiff {
+			stats.maxDiff = diff
+		}
+		stats.instruments[alert.InstID]++
 	}
-	if alert.LastSeen.After(stats.lastAlert) {
+	if alert.LastSeen.After(prevLast) {
 		stats.lastAlert = alert.LastSeen
 	}
-	if stats.windows == nil {
-		stats.windows = make(map[time.Duration]struct{})
+	if alert.TimingPattern != nil {
+		stats.cadence = alert.TimingPattern.Interval
+		stats.cadenceJitter = alert.TimingPattern.Jitter
+		stats.cadenceSamples = alert.TimingPattern.Samples
 	}
-	stats.windows[alert.Window] = struct{}{}
 
 	w.mu.Unlock()
 	return nil
 }
 
-func (w *webSink) ensureStats(instID, pattern string) *aggregateStats {
-	perPattern, ok := w.stats[instID]
+func (w *webSink) ensureStats(tag string) *aggregateStats {
+	stat, ok := w.stats[tag]
 	if !ok {
-		perPattern = make(map[string]*aggregateStats)
-		w.stats[instID] = perPattern
-	}
-	stat, ok := perPattern[pattern]
-	if !ok {
-		stat = &aggregateStats{}
-		perPattern[pattern] = stat
+		stat = &aggregateStats{
+			tag:         tag,
+			windows:     make(map[time.Duration]struct{}),
+			instruments: make(map[string]int),
+		}
+		w.stats[tag] = stat
 	}
 	return stat
 }
@@ -157,47 +184,55 @@ func (w *webSink) snapshot() []tableEntry {
 func (w *webSink) snapshotLocked() []tableEntry {
 	entries := make([]tableEntry, 0)
 	now := time.Now()
-	for inst, patterns := range w.stats {
-		for pattern, stats := range patterns {
-			if !w.start.IsZero() && (stats.lastAlert.IsZero() || stats.lastAlert.Before(w.start)) {
-				delete(patterns, pattern)
-				continue
-			}
-			if w.retention > 0 && !stats.lastAlert.IsZero() && now.Sub(stats.lastAlert) > w.retention {
-				delete(patterns, pattern)
-				continue
-			}
-			avg := time.Duration(0)
-			if stats.alerts > 0 {
-				avg = time.Duration(int64(stats.totalDiff) / int64(stats.alerts))
-			}
-			windows := make([]time.Duration, 0, len(stats.windows))
-			for window := range stats.windows {
-				windows = append(windows, window)
-			}
-			entries = append(entries, tableEntry{
-				Instrument:    inst,
-				Pattern:       pattern,
-				Alerts:        stats.alerts,
-				TotalNotional: stats.totalNotional,
-				AvgDiff:       avg,
-				MaxDiff:       stats.maxDiff,
-				Windows:       windows,
-				LastAlert:     stats.lastAlert,
-			})
+	for tag, stats := range w.stats {
+		if !w.start.IsZero() && (stats.lastAlert.IsZero() || stats.lastAlert.Before(w.start)) {
+			delete(w.stats, tag)
+			continue
 		}
-		if len(patterns) == 0 {
-			delete(w.stats, inst)
+		if w.retention > 0 && !stats.lastAlert.IsZero() && now.Sub(stats.lastAlert) > w.retention {
+			delete(w.stats, tag)
+			continue
 		}
+		avg := time.Duration(0)
+		if stats.alerts > 0 {
+			avg = time.Duration(int64(stats.totalDiff) / int64(stats.alerts))
+		}
+		windows := make([]time.Duration, 0, len(stats.windows))
+		for window := range stats.windows {
+			windows = append(windows, window)
+		}
+		sort.Slice(windows, func(i, j int) bool { return windows[i] < windows[j] })
+		instruments := make([]string, 0, len(stats.instruments))
+		for inst := range stats.instruments {
+			instruments = append(instruments, inst)
+		}
+		sort.Strings(instruments)
+		cadenceSummary := buildCadenceSummary(stats.cadence, stats.cadenceJitter, stats.cadenceSamples)
+		pattern := stats.pattern
+		if strings.TrimSpace(pattern) == "" {
+			pattern = tag
+		}
+		entries = append(entries, tableEntry{
+			Tag:            tag,
+			Pattern:        pattern,
+			Instruments:    instruments,
+			Alerts:         stats.alerts,
+			TotalNotional:  stats.totalNotional,
+			AvgDiff:        avg,
+			MaxDiff:        stats.maxDiff,
+			Windows:        windows,
+			LastAlert:      stats.lastAlert,
+			Cadence:        stats.cadence,
+			CadenceJitter:  stats.cadenceJitter,
+			CadenceSamples: stats.cadenceSamples,
+			CadenceSummary: cadenceSummary,
+		})
 	}
 
 	sort.Slice(entries, func(i, j int) bool {
 		cmp := entries[i].TotalNotional.Cmp(entries[j].TotalNotional)
 		if cmp == 0 {
-			if entries[i].Instrument == entries[j].Instrument {
-				return entries[i].Pattern < entries[j].Pattern
-			}
-			return entries[i].Instrument < entries[j].Instrument
+			return entries[i].Tag < entries[j].Tag
 		}
 		return cmp > 0
 	})
@@ -248,10 +283,11 @@ func (w *webSink) handleAPI(rw http.ResponseWriter, r *http.Request) {
 }
 
 var indexTemplate = template.Must(template.New("index").Funcs(template.FuncMap{
-	"formatDuration":  formatDuration,
-	"formatWindows":   formatWindows,
-	"formatLast":      formatLast,
-	"truncatePattern": truncatePattern,
+	"formatDuration":    formatDuration,
+	"formatWindows":     formatWindows,
+	"formatLast":        formatLast,
+	"truncatePattern":   truncatePattern,
+	"formatInstruments": formatInstruments,
 }).Parse(`<!doctype html>
 <html lang="en">
 <head>
@@ -277,13 +313,15 @@ var indexTemplate = template.Must(template.New("index").Funcs(template.FuncMap{
   <table>
     <thead>
       <tr>
-        <th>Ticker</th>
+        <th>Tag</th>
+        <th>Instruments</th>
         <th>Pattern</th>
         <th class="center">Alerts</th>
         <th class="right">Total Notional (USDT)</th>
         <th class="right">Avg Diff</th>
         <th class="right">Max Diff</th>
         <th>Windows</th>
+        <th class="right">Cadence</th>
         <th>Last Alert</th>
       </tr>
     </thead>
@@ -291,19 +329,21 @@ var indexTemplate = template.Must(template.New("index").Funcs(template.FuncMap{
       {{ if .Entries }}
         {{ range .Entries }}
           <tr>
-            <td>{{ .Instrument }}</td>
+            <td>{{ .Tag }}</td>
+            <td>{{ formatInstruments .Instruments }}</td>
             <td>{{ truncatePattern .Pattern }}</td>
             <td class="center">{{ .Alerts }}</td>
             <td class="right">{{ .TotalNotional }}</td>
             <td class="right">{{ formatDuration .AvgDiff }}</td>
             <td class="right">{{ formatDuration .MaxDiff }}</td>
             <td>{{ formatWindows .Windows }}</td>
+            <td class="right">{{ if .CadenceSummary }}{{ .CadenceSummary }}{{ else }}-{{ end }}</td>
             <td>{{ formatLast .LastAlert }}</td>
           </tr>
         {{ end }}
       {{ else }}
         <tr>
-          <td colspan="8" class="center">No duplicates observed yet.</td>
+          <td colspan="10" class="center">No duplicates observed yet.</td>
         </tr>
       {{ end }}
     </tbody>
@@ -335,6 +375,13 @@ func formatWindows(set []time.Duration) string {
 	return strings.Join(parts, ", ")
 }
 
+func formatInstruments(set []string) string {
+	if len(set) == 0 {
+		return "-"
+	}
+	return strings.Join(set, ", ")
+}
+
 func formatLast(t time.Time) string {
 	if t.IsZero() {
 		return "-"
@@ -357,29 +404,31 @@ func formatPattern(alert Alert) string {
 	price, notional, side := parseKeyFields(alert)
 	direction := formatDirection(side)
 
+	var pattern string
 	switch alert.DuplicateMode {
 	case config.DuplicateModePriceOnly:
-		if price.Equal(decimal.Zero) {
-			return direction
+		if !price.Equal(decimal.Zero) {
+			pattern = price.String()
 		}
-		if direction == "" {
-			return price.String()
-		}
-		return fmt.Sprintf("%s %s", price.String(), direction)
 	default:
-		base := ""
 		if !price.Equal(decimal.Zero) && !notional.Equal(decimal.Zero) {
-			base = fmt.Sprintf("%s x %s USDT", price.String(), notional.String())
+			pattern = fmt.Sprintf("%s x %s USDT", price.String(), notional.String())
 		} else if !price.Equal(decimal.Zero) {
-			base = price.String()
-		} else {
-			base = alert.Key
+			pattern = price.String()
 		}
-		if direction == "" {
-			return base
-		}
-		return strings.TrimSpace(base + " " + direction)
 	}
+	if pattern == "" {
+		if direction != "" {
+			pattern = direction
+			direction = ""
+		} else {
+			pattern = alert.Key
+		}
+	}
+	if direction != "" {
+		pattern = strings.TrimSpace(pattern + " " + direction)
+	}
+	return pattern
 }
 
 func formatDirection(side string) string {
@@ -426,4 +475,33 @@ func safeDecimal(value string) decimal.Decimal {
 		return decimal.Zero
 	}
 	return d
+}
+
+func buildCadenceSummary(cadence, jitter time.Duration, samples int) string {
+	if cadence <= 0 || samples <= 0 {
+		return ""
+	}
+	summary := formatCompactDuration(cadence)
+	if jitter > 0 {
+		summary = fmt.Sprintf("%s (spread %s)", summary, formatCompactDuration(jitter))
+	}
+	return fmt.Sprintf("%s, n=%d", summary, samples)
+}
+
+func formatCompactDuration(d time.Duration) string {
+	if d <= 0 {
+		return "0s"
+	}
+	rounded := d
+	if d < time.Minute {
+		rounded = d.Round(10 * time.Millisecond)
+	}
+	if rounded < time.Second {
+		return fmt.Sprintf("%dms", rounded/time.Millisecond)
+	}
+	if rounded < time.Minute {
+		seconds := float64(rounded) / float64(time.Second)
+		return fmt.Sprintf("%.2fs", seconds)
+	}
+	return rounded.String()
 }

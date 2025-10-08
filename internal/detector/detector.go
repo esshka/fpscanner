@@ -19,18 +19,84 @@ import (
 type Detector struct {
 	logger  zerolog.Logger
 	metrics *metrics.Collector
-	alerts  *alert.Router
+	alerts  alertDispatcher
 
-	mode       config.DuplicateMode
-	minDupes   int
-	windows    []time.Duration
-	cooldown   time.Duration
-	priceTick  decimal.Decimal
-	sizeTick   decimal.Decimal
-	useBuckets bool
+	mode            config.DuplicateMode
+	minDupes        int
+	windows         []time.Duration
+	cooldown        time.Duration
+	priceTick       decimal.Decimal
+	sizeTick        decimal.Decimal
+	useBuckets      bool
+	pattern         patternSettings
+	tagPriceTick    decimal.Decimal
+	tagNotionalTick decimal.Decimal
+	tags            *robotTagger
 
 	mu     sync.Mutex
 	states map[string]map[time.Duration]*windowState // instId -> window -> state
+}
+
+type patternSettings struct {
+	enabled        bool
+	minOccurrences int
+	maxLookback    int
+	maxJitter      time.Duration
+	relativeJitter float64
+	minInterval    time.Duration
+}
+
+type timingPatternResult struct {
+	interval time.Duration
+	jitter   time.Duration
+	samples  int
+}
+
+type robotTagger struct {
+	mu   sync.Mutex
+	next int
+	tags map[string]string
+}
+
+func newRobotTagger() *robotTagger {
+	return &robotTagger{
+		tags: make(map[string]string),
+	}
+}
+
+func (r *robotTagger) tag(signature string) string {
+	return r.tagWithBase(signature, "")
+}
+
+func (r *robotTagger) tagWithBase(signature, base string) string {
+	if signature == "" {
+		signature = base
+	}
+	if signature == "" {
+		return ""
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if tag, ok := r.tags[signature]; ok {
+		return tag
+	}
+	if base != "" {
+		if tag, ok := r.tags[base]; ok {
+			r.tags[signature] = tag
+			return tag
+		}
+	}
+	r.next++
+	tag := fmt.Sprintf("RB-%03d", r.next)
+	r.tags[signature] = tag
+	if base != "" {
+		r.tags[base] = tag
+	}
+	return tag
+}
+
+type alertDispatcher interface {
+	Dispatch(alert.Alert)
 }
 
 // New creates a detector from configuration.
@@ -38,11 +104,14 @@ func New(cfg config.ScreenerConfig, alerts *alert.Router, collector *metrics.Col
 	d := &Detector{
 		logger:   logger,
 		metrics:  collector,
-		alerts:   alerts,
 		mode:     cfg.DuplicateMode,
 		minDupes: cfg.MinDupes,
 		cooldown: cfg.Cooldown.OrDefault(60 * time.Second),
 		states:   make(map[string]map[time.Duration]*windowState),
+		tags:     newRobotTagger(),
+	}
+	if alerts != nil {
+		d.alerts = alerts
 	}
 
 	if len(cfg.Windows) == 0 {
@@ -69,6 +138,33 @@ func New(cfg config.ScreenerConfig, alerts *alert.Router, collector *metrics.Col
 		d.priceTick = priceTick
 		d.sizeTick = sizeTick
 		d.useBuckets = true
+	}
+
+	d.pattern = patternSettings{
+		enabled:        cfg.Pattern.MinOccurrences >= 2,
+		minOccurrences: cfg.Pattern.MinOccurrences,
+		maxLookback:    cfg.Pattern.MaxLookback,
+		maxJitter:      cfg.Pattern.MaxJitter.OrDefault(150 * time.Millisecond),
+		relativeJitter: cfg.Pattern.RelativeJitter,
+		minInterval:    cfg.Pattern.MinInterval.OrDefault(0),
+	}
+	if d.pattern.maxLookback == 0 || d.pattern.maxLookback < d.pattern.minOccurrences {
+		d.pattern.maxLookback = d.pattern.minOccurrences
+	}
+
+	if tick := strings.TrimSpace(cfg.Tagging.PriceTick); tick != "" {
+		parsed, err := parseTick(tick)
+		if err != nil {
+			return nil, fmt.Errorf("detector: invalid tagging price tick: %w", err)
+		}
+		d.tagPriceTick = parsed
+	}
+	if tick := strings.TrimSpace(cfg.Tagging.NotionalTick); tick != "" {
+		parsed, err := parseTick(tick)
+		if err != nil {
+			return nil, fmt.Errorf("detector: invalid tagging notional tick: %w", err)
+		}
+		d.tagNotionalTick = parsed
 	}
 
 	return d, nil
@@ -118,8 +214,33 @@ func (d *Detector) Process(evt trade.Event) {
 			d.metrics.ObserveWindowEvent(evt.InstID, window)
 		}
 
-		if shouldAlert {
-			if d.metrics != nil {
+		var patternResult *timingPatternResult
+		var patternAllowed bool
+		if d.pattern.enabled {
+			patternResult = state.detectTimingPattern(key, d.pattern)
+			if patternResult != nil && state.canEmitPattern(evt.Timestamp, key) {
+				patternAllowed = true
+			}
+		}
+
+		emitAlert := shouldAlert || patternAllowed
+		if emitAlert {
+			signature, baseSignature := d.robotSignature(evt, patternResult)
+			robotTag := ""
+			if d.tags != nil {
+				robotTag = d.tags.tagWithBase(signature, baseSignature)
+			}
+			var timingPattern *alert.TimingPattern
+			if patternResult != nil {
+				timingPattern = &alert.TimingPattern{
+					Type:     alert.PatternTypeUniformInterval,
+					Interval: patternResult.interval,
+					Jitter:   patternResult.jitter,
+					Samples:  patternResult.samples,
+				}
+				state.markPatternAlert(evt.Timestamp, key)
+			}
+			if shouldAlert && d.metrics != nil {
 				d.metrics.IncDuplicateKey(window)
 			}
 			if d.alerts != nil {
@@ -132,6 +253,8 @@ func (d *Detector) Process(evt trade.Event) {
 					Count:         count,
 					FirstSeen:     firstSeen,
 					LastSeen:      evt.Timestamp,
+					TimingPattern: timingPattern,
+					RobotTag:      robotTag,
 				})
 			}
 		}
@@ -188,10 +311,11 @@ type windowState struct {
 	duration time.Duration
 	cooldown time.Duration
 
-	queue   []keyedEvent
-	head    int
-	buckets map[string]*timestampQueue
-	alerts  map[string]time.Time
+	queue         []keyedEvent
+	head          int
+	buckets       map[string]*timestampQueue
+	alerts        map[string]time.Time
+	patternAlerts map[string]time.Time
 }
 
 type keyedEvent struct {
@@ -201,10 +325,11 @@ type keyedEvent struct {
 
 func newWindowState(duration, cooldown time.Duration) *windowState {
 	return &windowState{
-		duration: duration,
-		cooldown: cooldown,
-		buckets:  make(map[string]*timestampQueue),
-		alerts:   make(map[string]time.Time),
+		duration:      duration,
+		cooldown:      cooldown,
+		buckets:       make(map[string]*timestampQueue),
+		alerts:        make(map[string]time.Time),
+		patternAlerts: make(map[string]time.Time),
 	}
 }
 
@@ -252,6 +377,7 @@ func (w *windowState) evictBefore(cutoff time.Time) {
 			if bucket.len() == 0 {
 				delete(w.buckets, ev.key)
 				delete(w.alerts, ev.key)
+				delete(w.patternAlerts, ev.key)
 			}
 		}
 	}
@@ -270,6 +396,126 @@ func (w *windowState) evictBefore(cutoff time.Time) {
 	}
 }
 
+func (w *windowState) detectTimingPattern(key string, cfg patternSettings) *timingPatternResult {
+	if !cfg.enabled {
+		return nil
+	}
+	bucket, ok := w.buckets[key]
+	if !ok || bucket == nil {
+		return nil
+	}
+	timestamps := bucket.timestamps()
+	if len(timestamps) < cfg.minOccurrences {
+		return nil
+	}
+	if cfg.maxLookback > 0 && len(timestamps) > cfg.maxLookback {
+		timestamps = timestamps[len(timestamps)-cfg.maxLookback:]
+		if len(timestamps) < cfg.minOccurrences {
+			return nil
+		}
+	}
+	intervals := make([]time.Duration, 0, len(timestamps)-1)
+	for i := 1; i < len(timestamps); i++ {
+		delta := timestamps[i].Sub(timestamps[i-1])
+		if delta <= 0 {
+			return nil
+		}
+		if cfg.minInterval > 0 && delta < cfg.minInterval {
+			return nil
+		}
+		intervals = append(intervals, delta)
+	}
+	if len(intervals) < cfg.minOccurrences-1 {
+		return nil
+	}
+	sum := time.Duration(0)
+	minDelta := intervals[0]
+	maxDelta := intervals[0]
+	for _, delta := range intervals {
+		sum += delta
+		if delta < minDelta {
+			minDelta = delta
+		}
+		if delta > maxDelta {
+			maxDelta = delta
+		}
+	}
+	avg := time.Duration(int64(sum) / int64(len(intervals)))
+	jitter := maxDelta - minDelta
+	allowed := cfg.maxJitter
+	if avg > 0 && cfg.relativeJitter > 0 {
+		if rel := time.Duration(float64(avg) * cfg.relativeJitter); rel > allowed {
+			allowed = rel
+		}
+	}
+	if allowed == 0 {
+		if jitter > 0 {
+			return nil
+		}
+	} else if jitter > allowed {
+		return nil
+	}
+	return &timingPatternResult{
+		interval: avg,
+		jitter:   jitter,
+		samples:  len(timestamps),
+	}
+}
+
+func (w *windowState) canEmitPattern(ts time.Time, key string) bool {
+	last, ok := w.patternAlerts[key]
+	if !ok {
+		return true
+	}
+	return ts.Sub(last) >= w.cooldown
+}
+
+func (w *windowState) markPatternAlert(ts time.Time, key string) {
+	if w.patternAlerts == nil {
+		w.patternAlerts = make(map[string]time.Time)
+	}
+	w.patternAlerts[key] = ts
+}
+
+func (d *Detector) robotSignature(evt trade.Event, pattern *timingPatternResult) (string, string) {
+	side := strings.ToLower(strings.TrimSpace(evt.Side))
+	if side == "" {
+		side = "unknown"
+	}
+	notional := evt.Price.Mul(evt.Size)
+	notionalBucket := notional
+	if !d.tagNotionalTick.Equal(decimal.Zero) {
+		notionalBucket = bucketValue(notionalBucket, d.tagNotionalTick)
+	}
+	parts := []string{evt.InstID, string(d.mode), side, notionalBucket.String()}
+	if !d.tagPriceTick.Equal(decimal.Zero) {
+		priceBucket := bucketValue(evt.Price, d.tagPriceTick)
+		parts = append(parts, priceBucket.String())
+	}
+	base := strings.Join(parts, "|")
+	if pattern == nil || pattern.interval <= 0 {
+		return base, base
+	}
+	interval := normalizeDuration(pattern.interval)
+	jitter := normalizeDuration(pattern.jitter)
+	detail := fmt.Sprintf("%s|cad:%d", base, interval.Milliseconds())
+	if jitter > 0 {
+		detail = fmt.Sprintf("%s|jit:%d", detail, jitter.Milliseconds())
+	}
+	detail = fmt.Sprintf("%s|samples:%d", detail, pattern.samples)
+	return detail, base
+}
+
+func normalizeDuration(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	if d < 10*time.Millisecond {
+		return d
+	}
+	return d.Round(10 * time.Millisecond)
+}
+
 // timestampQueue is a simple deque for timestamps.
 type timestampQueue struct {
 	data []time.Time
@@ -278,6 +524,13 @@ type timestampQueue struct {
 
 func (q *timestampQueue) len() int {
 	return len(q.data) - q.head
+}
+
+func (q *timestampQueue) timestamps() []time.Time {
+	if q.head >= len(q.data) {
+		return nil
+	}
+	return q.data[q.head:]
 }
 
 func (q *timestampQueue) push(ts time.Time) {
