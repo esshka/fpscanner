@@ -65,7 +65,7 @@ implementation.
 | `instruments` | List of `{instType, instId}` pairs. These are sharded across websocket connections according to `websocket.batchSize`. |
 | `websocket`   | `maxMessagesPerSec`, `subscribeChunk`, and `subscribeInterval` enforce Bitget’s 10 msg/s budget. `backoff` controls reconnect behaviour (initial/max interval, multiplier, jitter). |
 | `screener`    | `windows` accepts Go duration strings (`30s`, `500ms`). `duplicateMode` can be `strict`, `priceOnly`, or `bucketed` (requires `bucket.priceTick` and `bucket.sizeTick`). `cooldown` throttles repeat alerts per `(instId, window, key)`. |
-| `alerts`      | `console` toggles structured logs; `table` launches a full-screen TUI (built with `tview`) that aggregates duplicates per instrument and pattern. `tableRetention` controls how long inactive rows stick around (default 15m). `webhooks` is a list of HTTPS endpoints. `slackWebhook` sends Slack-compatible payloads. `retry` uses exponential backoff when a sink fails. |
+| `alerts`      | `console` toggles structured logs; `table` starts a lightweight web UI (served from `tableListenAddr`, default `:9300`) that aggregates duplicates per instrument and pattern. `tableRetention` controls how long inactive rows stick around (default 15m). `webhooks` is a list of HTTPS endpoints. `slackWebhook` sends Slack-compatible payloads. `retry` uses exponential backoff when a sink fails. |
 | `metrics`     | Set `listenAddr` for the Prometheus HTTP listener, e.g. `":9100"` or `"0.0.0.0:9100"`. |
 | `warmStart`   | Enable to fetch recent trades via REST after reconnects. `lookback` defines how far back to replay trades; `maxRequestsPerSecond` throttles requests per Bitget’s 10 rps cap. |
 
@@ -83,9 +83,9 @@ Sample log:
 - `windowSec` indicates which window triggered the alert. Multiple windows may fire if the trades overlap several durations.
 - `sink` reveals the destination (console, webhook, Slack, etc.).
 
-Enable human-readable logs with `logging.human=true` while tuning, or switch on `alerts.table=true` to render an ASCII table that mimics common desktop scanners. Once integrated with log pipelines, revert to JSON console output for parsing.
+Enable human-readable logs with `logging.human=true` while tuning, or switch on `alerts.table=true` to launch the built-in web UI at `http://<tableListenAddr>` (defaults to `http://localhost:9300`). The page auto-refreshes every few seconds and also exposes a JSON feed at `/api/alerts`. Once integrated with log pipelines, revert to JSON console output for parsing.
 
-Example aggregated TUI table (`alerts.table=true`):
+Example web UI snapshot (`alerts.table=true`):
 
 ```
 +----------+----------------------+---------+--------------+------------+------------+----------------------+----------------------+
@@ -96,9 +96,9 @@ Example aggregated TUI table (`alerts.table=true`):
 +----------+----------------------+---------+--------------+------------+------------+----------------------+----------------------+
 ```
 
-Rows are sorted by cumulative duplicate volume. `Alerts` counts how many duplicate alerts fired for that instrument/pattern pair, `Total Volume` sums the duplicate volume (`size × count` per alert), `Avg Diff`/`Max Diff` track the window span between first/last trade for each alert, `Windows` lists the time windows that have triggered for that pattern, and `Last Alert` shows the latest local timestamp. Rows older than `alerts.tableRetention` (and anything observed before the current run) are automatically purged. Use the arrow keys or mouse to scroll within the TUI; press `q`, `Esc`, or `Ctrl+C` to exit.
+Rows are sorted by cumulative duplicate volume. `Alerts` counts how many duplicate alerts fired for that instrument/pattern pair, `Total Volume` sums the duplicate volume (`size × count` per alert), `Avg Diff`/`Max Diff` track the window span between first/last trade for each alert, `Windows` lists the time windows that have triggered for that pattern, and `Last Alert` shows the latest local timestamp. Rows older than `alerts.tableRetention` (and anything observed before the current run) are automatically purged. The HTML view refreshes automatically; hit `/api/alerts` for the underlying JSON if you want to drive dashboards or bots.
 
-> The TUI renders directly to STDOUT; if you need structured logs simultaneously, consider shipping them to another sink (e.g. file) or running a second instance without `alerts.table`.
+> The web UI runs on the configured `alerts.tableListenAddr`. Make sure the port is reachable (or firewalled) according to your environment.
 
 ### Metrics & Health Checks
 

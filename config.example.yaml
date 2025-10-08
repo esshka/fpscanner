@@ -37,6 +37,7 @@ alerts:
   timeout: 5s
   table: true
   tableRetention: 15m
+  tableListenAddr: ":9300"
 
 metrics:
   listenAddr: ":9100"
