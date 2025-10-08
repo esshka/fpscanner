@@ -35,23 +35,23 @@ type webSink struct {
 }
 
 type aggregateStats struct {
-	alerts      int
-	totalVolume decimal.Decimal
-	totalDiff   time.Duration
-	maxDiff     time.Duration
-	lastAlert   time.Time
-	windows     map[time.Duration]struct{}
+	alerts        int
+	totalNotional decimal.Decimal
+	totalDiff     time.Duration
+	maxDiff       time.Duration
+	lastAlert     time.Time
+	windows       map[time.Duration]struct{}
 }
 
 type tableEntry struct {
-	Instrument  string          `json:"instrument"`
-	Pattern     string          `json:"pattern"`
-	Alerts      int             `json:"alerts"`
-	TotalVolume decimal.Decimal `json:"totalVolume"`
-	AvgDiff     time.Duration   `json:"avgDiff"`
-	MaxDiff     time.Duration   `json:"maxDiff"`
-	Windows     []time.Duration `json:"windows"`
-	LastAlert   time.Time       `json:"lastAlert"`
+	Instrument    string          `json:"instrument"`
+	Pattern       string          `json:"pattern"`
+	Alerts        int             `json:"alerts"`
+	TotalNotional decimal.Decimal `json:"totalNotional"`
+	AvgDiff       time.Duration   `json:"avgDiff"`
+	MaxDiff       time.Duration   `json:"maxDiff"`
+	Windows       []time.Duration `json:"windows"`
+	LastAlert     time.Time       `json:"lastAlert"`
 }
 
 func newWebSink(addr string, retention time.Duration, logger zerolog.Logger) *webSink {
@@ -106,7 +106,7 @@ func (w *webSink) Start(ctx context.Context) error {
 }
 
 func (w *webSink) Send(_ context.Context, alert Alert) error {
-	_, size, _ := parseKeyFields(alert)
+	_, notional, _ := parseKeyFields(alert)
 
 	w.mu.Lock()
 	stats := w.ensureStats(alert.InstID, formatPattern(alert))
@@ -117,7 +117,7 @@ func (w *webSink) Send(_ context.Context, alert Alert) error {
 	}
 
 	stats.alerts++
-	stats.totalVolume = stats.totalVolume.Add(size.Mul(decimal.NewFromInt(int64(alert.Count))))
+	stats.totalNotional = stats.totalNotional.Add(notional.Mul(decimal.NewFromInt(int64(alert.Count))))
 	stats.totalDiff += diff
 	if diff > stats.maxDiff {
 		stats.maxDiff = diff
@@ -176,14 +176,14 @@ func (w *webSink) snapshotLocked() []tableEntry {
 				windows = append(windows, window)
 			}
 			entries = append(entries, tableEntry{
-				Instrument:  inst,
-				Pattern:     pattern,
-				Alerts:      stats.alerts,
-				TotalVolume: stats.totalVolume,
-				AvgDiff:     avg,
-				MaxDiff:     stats.maxDiff,
-				Windows:     windows,
-				LastAlert:   stats.lastAlert,
+				Instrument:    inst,
+				Pattern:       pattern,
+				Alerts:        stats.alerts,
+				TotalNotional: stats.totalNotional,
+				AvgDiff:       avg,
+				MaxDiff:       stats.maxDiff,
+				Windows:       windows,
+				LastAlert:     stats.lastAlert,
 			})
 		}
 		if len(patterns) == 0 {
@@ -192,7 +192,7 @@ func (w *webSink) snapshotLocked() []tableEntry {
 	}
 
 	sort.Slice(entries, func(i, j int) bool {
-		cmp := entries[i].TotalVolume.Cmp(entries[j].TotalVolume)
+		cmp := entries[i].TotalNotional.Cmp(entries[j].TotalNotional)
 		if cmp == 0 {
 			if entries[i].Instrument == entries[j].Instrument {
 				return entries[i].Pattern < entries[j].Pattern
@@ -280,7 +280,7 @@ var indexTemplate = template.Must(template.New("index").Funcs(template.FuncMap{
         <th>Ticker</th>
         <th>Pattern</th>
         <th class="center">Alerts</th>
-        <th class="right">Total Volume</th>
+        <th class="right">Total Notional (USDT)</th>
         <th class="right">Avg Diff</th>
         <th class="right">Max Diff</th>
         <th>Windows</th>
@@ -294,7 +294,7 @@ var indexTemplate = template.Must(template.New("index").Funcs(template.FuncMap{
             <td>{{ .Instrument }}</td>
             <td>{{ truncatePattern .Pattern }}</td>
             <td class="center">{{ .Alerts }}</td>
-            <td class="right">{{ .TotalVolume }}</td>
+            <td class="right">{{ .TotalNotional }}</td>
             <td class="right">{{ formatDuration .AvgDiff }}</td>
             <td class="right">{{ formatDuration .MaxDiff }}</td>
             <td>{{ formatWindows .Windows }}</td>
@@ -354,7 +354,7 @@ func truncatePattern(pattern string) string {
 }
 
 func formatPattern(alert Alert) string {
-	price, size, side := parseKeyFields(alert)
+	price, notional, side := parseKeyFields(alert)
 	direction := formatDirection(side)
 
 	switch alert.DuplicateMode {
@@ -368,8 +368,8 @@ func formatPattern(alert Alert) string {
 		return fmt.Sprintf("%s %s", price.String(), direction)
 	default:
 		base := ""
-		if !price.Equal(decimal.Zero) && !size.Equal(decimal.Zero) {
-			base = fmt.Sprintf("%s x %s", price.String(), size.String())
+		if !price.Equal(decimal.Zero) && !notional.Equal(decimal.Zero) {
+			base = fmt.Sprintf("%s x %s USDT", price.String(), notional.String())
 		} else if !price.Equal(decimal.Zero) {
 			base = price.String()
 		} else {
@@ -396,13 +396,13 @@ func formatDirection(side string) string {
 	}
 }
 
-func parseKeyFields(a Alert) (price decimal.Decimal, size decimal.Decimal, side string) {
+func parseKeyFields(a Alert) (price decimal.Decimal, notional decimal.Decimal, side string) {
 	parts := strings.Split(a.Key, "|")
 	switch a.DuplicateMode {
 	case config.DuplicateModeStrict:
 		if len(parts) >= 3 {
 			price = safeDecimal(parts[0])
-			size = safeDecimal(parts[1])
+			notional = safeDecimal(parts[1])
 			side = parts[2]
 		}
 	case config.DuplicateModePriceOnly:
@@ -413,11 +413,11 @@ func parseKeyFields(a Alert) (price decimal.Decimal, size decimal.Decimal, side 
 	default:
 		if len(parts) >= 3 {
 			price = safeDecimal(parts[0])
-			size = safeDecimal(parts[1])
+			notional = safeDecimal(parts[1])
 			side = parts[2]
 		}
 	}
-	return price, size, side
+	return price, notional, side
 }
 
 func safeDecimal(value string) decimal.Decimal {

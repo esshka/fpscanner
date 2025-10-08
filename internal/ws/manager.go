@@ -201,7 +201,7 @@ func (w *connectionWorker) connectAndRun(ctx context.Context) error {
 
 	readErr := make(chan error, 1)
 	go func() {
-		readErr <- w.readLoop(ctx, conn, pingInterval)
+		readErr <- w.readLoop(ctx, conn, pingInterval, &pingMu, &lastPing)
 	}()
 
 	pingErr := make(chan error, 1)
@@ -237,7 +237,7 @@ func (w *connectionWorker) connectAndRun(ctx context.Context) error {
 	}
 }
 
-func (w *connectionWorker) readLoop(ctx context.Context, conn *websocket.Conn, pingInterval time.Duration) error {
+func (w *connectionWorker) readLoop(ctx context.Context, conn *websocket.Conn, pingInterval time.Duration, pingMu *sync.Mutex, lastPing *time.Time) error {
 	defer conn.SetReadDeadline(time.Time{})
 
 	for {
@@ -260,7 +260,24 @@ func (w *connectionWorker) readLoop(ctx context.Context, conn *websocket.Conn, p
 
 		trimmed := bytes.TrimSpace(payload)
 		if bytes.Equal(trimmed, []byte("pong")) {
-			// server-side pong to client ping
+			pingMu.Lock()
+			sent := *lastPing
+			pingMu.Unlock()
+			if !sent.IsZero() && w.metrics != nil {
+				w.metrics.ObservePingPong(time.Since(sent))
+			}
+			continue
+		}
+		if bytes.Equal(trimmed, []byte("ping")) {
+			// respond to server-side ping messages
+			if err := w.waitSend(ctx); err != nil {
+				return err
+			}
+			deadline := time.Now().Add(w.cfg.MessageWriteTimeout.OrDefault(5 * time.Second))
+			conn.SetWriteDeadline(deadline)
+			if err := conn.WriteMessage(websocket.TextMessage, []byte("pong")); err != nil {
+				return err
+			}
 			continue
 		}
 
@@ -355,7 +372,7 @@ func (w *connectionWorker) pingLoop(ctx context.Context, conn *websocket.Conn, i
 			mu.Lock()
 			*lastPing = time.Now()
 			mu.Unlock()
-			if err := conn.WriteControl(websocket.PingMessage, []byte("ping"), deadline); err != nil {
+			if err := conn.WriteMessage(websocket.TextMessage, []byte("ping")); err != nil {
 				return err
 			}
 		}

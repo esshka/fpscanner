@@ -155,9 +155,10 @@ func (d *Detector) Consume(evt trade.Event) {
 
 func (d *Detector) keyFor(evt trade.Event) (string, error) {
 	side := strings.ToLower(evt.Side)
+	notional := evt.Price.Mul(evt.Size)
 	switch d.mode {
 	case config.DuplicateModeStrict:
-		return fmt.Sprintf("%s|%s|%s", evt.Price.String(), evt.Size.String(), side), nil
+		return fmt.Sprintf("%s|%s|%s", evt.Price.String(), notional.String(), side), nil
 	case config.DuplicateModePriceOnly:
 		return fmt.Sprintf("%s|%s", evt.Price.String(), side), nil
 	case config.DuplicateModeBucketed:
@@ -165,8 +166,8 @@ func (d *Detector) keyFor(evt trade.Event) (string, error) {
 			return "", fmt.Errorf("bucketed mode but ticks not configured")
 		}
 		priceBucket := bucketValue(evt.Price, d.priceTick)
-		sizeBucket := bucketValue(evt.Size, d.sizeTick)
-		return fmt.Sprintf("%s|%s|%s", priceBucket.String(), sizeBucket.String(), side), nil
+		notionalBucket := bucketValue(notional, d.sizeTick)
+		return fmt.Sprintf("%s|%s|%s", priceBucket.String(), notionalBucket.String(), side), nil
 	default:
 		return "", fmt.Errorf("unknown duplicate mode %q", d.mode)
 	}

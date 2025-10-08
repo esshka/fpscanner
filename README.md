@@ -64,7 +64,7 @@ implementation.
 |--------------|--------------|
 | `instruments` | List of `{instType, instId}` pairs. These are sharded across websocket connections according to `websocket.batchSize`. |
 | `websocket`   | `maxMessagesPerSec`, `subscribeChunk`, and `subscribeInterval` enforce Bitget’s 10 msg/s budget. `backoff` controls reconnect behaviour (initial/max interval, multiplier, jitter). |
-| `screener`    | `windows` accepts Go duration strings (`30s`, `500ms`). `duplicateMode` can be `strict`, `priceOnly`, or `bucketed` (requires `bucket.priceTick` and `bucket.sizeTick`). `cooldown` throttles repeat alerts per `(instId, window, key)`. |
+| `screener`    | `windows` accepts Go duration strings (`30s`, `500ms`). `duplicateMode` can be `strict`, `priceOnly`, or `bucketed` (requires `bucket.priceTick` and `bucket.sizeTick`, which now controls USDT notional bucketing). `cooldown` throttles repeat alerts per `(instId, window, key)`. |
 | `alerts`      | `console` toggles structured logs; `table` starts a lightweight web UI (served from `tableListenAddr`, default `:9300`) that aggregates duplicates per instrument and pattern. `tableRetention` controls how long inactive rows stick around (default 15m). `webhooks` is a list of HTTPS endpoints. `slackWebhook` sends Slack-compatible payloads. `retry` uses exponential backoff when a sink fails. |
 | `metrics`     | Set `listenAddr` for the Prometheus HTTP listener, e.g. `":9100"` or `"0.0.0.0:9100"`. |
 | `warmStart`   | Enable to fetch recent trades via REST after reconnects. `lookback` defines how far back to replay trades; `maxRequestsPerSecond` throttles requests per Bitget’s 10 rps cap. |
@@ -78,7 +78,7 @@ Sample log:
 ```
 
 - Timestamp uses local time; `mode` shows the active duplicate definition.
-- `key` is the tuple `(price|size|side)` for `strict`, `(price|side)` for `priceOnly`, or bucketed values.
+- `key` is the tuple `(price|notional|side)` for `strict`, `(price|side)` for `priceOnly`, or bucketed values rounded to the configured ticks.
 - `count` is how many matching trades landed inside the sliding window; `firstSeen` and `lastSeen` are UTC.
 - `windowSec` indicates which window triggered the alert. Multiple windows may fire if the trades overlap several durations.
 - `sink` reveals the destination (console, webhook, Slack, etc.).
@@ -88,15 +88,15 @@ Enable human-readable logs with `logging.human=true` while tuning, or switch on 
 Example web UI snapshot (`alerts.table=true`):
 
 ```
-+----------+----------------------+---------+--------------+------------+------------+----------------------+----------------------+
-| Ticker   | Pattern              | Alerts  | Total Volume | Avg Diff   | Max Diff   | Windows        | Last Alert (local)  |
-+----------+----------------------+---------+--------------+------------+------------+----------------------+----------------------+
-| COAIUSDT | 3.7876 x 2.63 Down   |       5 | 16.42        | 00:00:03   | 00:00:05   | 11s,12s,15s,30s | 13:44:22             |
-| COAIUSDT | 3.7854 x 0.43 Up     |       2 | 10.52        | 00:00:46   | 00:01:08   | 30s             | 13:44:22             |
-+----------+----------------------+---------+--------------+------------+------------+----------------------+----------------------+
++----------+---------------------------+---------+-----------------------+------------+------------+----------------------+----------------------+
+| Ticker   | Pattern                   | Alerts  | Total Notional (USDT) | Avg Diff   | Max Diff   | Windows              | Last Alert (local)  |
++----------+---------------------------+---------+-----------------------+------------+------------+----------------------+----------------------+
+| COAIUSDT | 3.7876 x 42.90 USDT Down  |       5 | 214.50                | 00:00:03   | 00:00:05   | 11s,12s,15s,30s      | 13:44:22             |
+| COAIUSDT | 3.7854 x 38.70 USDT Up    |       2 | 77.40                 | 00:00:46   | 00:01:08   | 30s                  | 13:44:22             |
++----------+---------------------------+---------+-----------------------+------------+------------+----------------------+----------------------+
 ```
 
-Rows are sorted by cumulative duplicate volume. `Alerts` counts how many duplicate alerts fired for that instrument/pattern pair, `Total Volume` sums the duplicate volume (`size × count` per alert), `Avg Diff`/`Max Diff` track the window span between first/last trade for each alert, `Windows` lists the time windows that have triggered for that pattern, and `Last Alert` shows the latest local timestamp. Rows older than `alerts.tableRetention` (and anything observed before the current run) are automatically purged. The HTML view refreshes automatically; hit `/api/alerts` for the underlying JSON if you want to drive dashboards or bots.
+Rows are sorted by cumulative duplicate notional. `Alerts` counts how many duplicate alerts fired for that instrument/pattern pair, `Total Notional (USDT)` sums the duplicate notional (`price × size × count` per alert), `Avg Diff`/`Max Diff` track the window span between first/last trade for each alert, `Windows` lists the time windows that have triggered for that pattern, and `Last Alert` shows the latest local timestamp. Rows older than `alerts.tableRetention` (and anything observed before the current run) are automatically purged. The HTML view refreshes automatically; hit `/api/alerts` for the underlying JSON if you want to drive dashboards or bots.
 
 > The web UI runs on the configured `alerts.tableListenAddr`. Make sure the port is reachable (or firewalled) according to your environment.
 

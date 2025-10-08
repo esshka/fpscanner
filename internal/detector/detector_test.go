@@ -70,7 +70,7 @@ func TestDetectorBucketedModeKeying(t *testing.T) {
 	price1 := decimal.RequireFromString("100.26")
 	price2 := decimal.RequireFromString("100.74")
 	size1 := decimal.RequireFromString("0.11")
-	size2 := decimal.RequireFromString("0.14")
+	size2 := decimal.RequireFromString("0.1092")
 
 	evt1 := trade.Event{InstType: "SPOT", InstID: "BTCUSDT", Side: "buy", Price: price1, Size: size1, Timestamp: time.Unix(0, 0)}
 	evt2 := trade.Event{InstType: "SPOT", InstID: "BTCUSDT", Side: "buy", Price: price2, Size: size2, Timestamp: time.Unix(0, 0).Add(200 * time.Millisecond)}
