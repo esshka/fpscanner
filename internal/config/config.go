@@ -112,6 +112,8 @@ type ScreenerConfig struct {
 	Cooldown      Duration      `yaml:"cooldown"`
 	TopN          int           `yaml:"topN"`
 	Bucket        BucketConfig  `yaml:"bucket"`
+	Pattern       PatternConfig `yaml:"pattern"`
+	Tagging       TaggingConfig `yaml:"tagging"`
 }
 
 // BucketConfig configures bucketed duplicate keys.
@@ -120,16 +122,32 @@ type BucketConfig struct {
 	SizeTick  string `yaml:"sizeTick"`
 }
 
+// PatternConfig tunes timing pattern detection.
+type PatternConfig struct {
+	MinOccurrences int      `yaml:"minOccurrences"`
+	MaxLookback    int      `yaml:"maxLookback"`
+	MaxJitter      Duration `yaml:"maxJitter"`
+	RelativeJitter float64  `yaml:"relativeJitter"`
+	MinInterval    Duration `yaml:"minInterval"`
+}
+
+// TaggingConfig controls robot tag bucketing.
+type TaggingConfig struct {
+	PriceTick    string `yaml:"priceTick"`
+	NotionalTick string `yaml:"notionalTick"`
+}
+
 // AlertConfig holds sink configuration for alerts.
 type AlertConfig struct {
-	Console        bool          `yaml:"console"`
-	Table          bool          `yaml:"table"`
-	Webhooks       []string      `yaml:"webhooks"`
-	SlackWebhook   string        `yaml:"slackWebhook"`
-	Cooldown       Duration      `yaml:"cooldown"`
-	Timeout        Duration      `yaml:"timeout"`
-	Retry          BackoffConfig `yaml:"retry"`
-	TableRetention Duration      `yaml:"tableRetention"`
+	Console         bool          `yaml:"console"`
+	Table           bool          `yaml:"table"`
+	Webhooks        []string      `yaml:"webhooks"`
+	SlackWebhook    string        `yaml:"slackWebhook"`
+	Cooldown        Duration      `yaml:"cooldown"`
+	Timeout         Duration      `yaml:"timeout"`
+	Retry           BackoffConfig `yaml:"retry"`
+	TableRetention  Duration      `yaml:"tableRetention"`
+	TableListenAddr string        `yaml:"tableListenAddr"`
 }
 
 // MetricsConfig configures the Prometheus metrics endpoint.
@@ -214,6 +232,17 @@ func defaultConfig() *Config {
 				PriceTick: "0.1",
 				SizeTick:  "0.1",
 			},
+			Pattern: PatternConfig{
+				MinOccurrences: 3,
+				MaxLookback:    6,
+				MaxJitter:      Duration{Duration: 150 * time.Millisecond},
+				RelativeJitter: 0.1,
+				MinInterval:    Duration{Duration: 50 * time.Millisecond},
+			},
+			Tagging: TaggingConfig{
+				PriceTick:    "",
+				NotionalTick: "10",
+			},
 		},
 		Alerts: AlertConfig{
 			Console:  true,
@@ -226,7 +255,8 @@ func defaultConfig() *Config {
 				Multiplier: 2.0,
 				Jitter:     0.2,
 			},
-			TableRetention: Duration{Duration: 15 * time.Minute},
+			TableRetention:  Duration{Duration: 15 * time.Minute},
+			TableListenAddr: ":9300",
 		},
 		Metrics: MetricsConfig{
 			ListenAddr: ":9100",
@@ -312,6 +342,31 @@ func (c *Config) applyDefaults() {
 	if c.Screener.TopN == 0 {
 		c.Screener.TopN = 5
 	}
+	if c.Screener.Pattern.MinOccurrences == 0 {
+		if c.Screener.MinDupes > 2 {
+			c.Screener.Pattern.MinOccurrences = c.Screener.MinDupes
+		} else {
+			c.Screener.Pattern.MinOccurrences = 2
+		}
+	}
+	if c.Screener.Pattern.MinOccurrences < 2 {
+		c.Screener.Pattern.MinOccurrences = 2
+	}
+	if c.Screener.Pattern.MaxLookback == 0 {
+		c.Screener.Pattern.MaxLookback = 6
+	}
+	if c.Screener.Pattern.MaxJitter.Duration == 0 {
+		c.Screener.Pattern.MaxJitter = Duration{Duration: 150 * time.Millisecond}
+	}
+	if c.Screener.Pattern.RelativeJitter <= 0 {
+		c.Screener.Pattern.RelativeJitter = 0.1
+	}
+	if c.Screener.Pattern.MinInterval.Duration == 0 {
+		c.Screener.Pattern.MinInterval = Duration{Duration: 50 * time.Millisecond}
+	}
+	if strings.TrimSpace(c.Screener.Tagging.NotionalTick) == "" {
+		c.Screener.Tagging.NotionalTick = "10"
+	}
 
 	if c.Alerts.Cooldown.Duration == 0 {
 		c.Alerts.Cooldown = Duration{Duration: 60 * time.Second}
@@ -333,6 +388,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Alerts.TableRetention.Duration == 0 {
 		c.Alerts.TableRetention = Duration{Duration: 15 * time.Minute}
+	}
+	if strings.TrimSpace(c.Alerts.TableListenAddr) == "" {
+		c.Alerts.TableListenAddr = ":9300"
 	}
 
 	if c.Metrics.ListenAddr == "" {
@@ -378,6 +436,21 @@ func (c *Config) Validate() error {
 	}
 	if c.Websocket.SubscribeChunk <= 0 {
 		return errors.New("config: subscribeChunk must be > 0")
+	}
+	if c.Screener.Pattern.MinOccurrences < 2 {
+		return errors.New("config: pattern.minOccurrences must be >= 2")
+	}
+	if c.Screener.Pattern.MaxLookback != 0 && c.Screener.Pattern.MaxLookback < c.Screener.Pattern.MinOccurrences {
+		return errors.New("config: pattern.maxLookback must be 0 or >= pattern.minOccurrences")
+	}
+	if c.Screener.Pattern.RelativeJitter < 0 {
+		return errors.New("config: pattern.relativeJitter must be >= 0")
+	}
+	if c.Screener.Pattern.MaxJitter.Duration < 0 {
+		return errors.New("config: pattern.maxJitter must be >= 0")
+	}
+	if c.Screener.Pattern.MinInterval.Duration < 0 {
+		return errors.New("config: pattern.minInterval must be >= 0")
 	}
 	return nil
 }
